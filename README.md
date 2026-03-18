@@ -5,6 +5,20 @@
 [![arXiv-2502.04144](https://img.shields.io/badge/arXiv-2502.04144-green.svg)](https://arxiv.org/abs/2502.04144)
 <!-- end badges -->
 
+## Viewer
+
+Simple script to view narrations with trajectory fixtures on videos.
+
+```bash
+conda create --name viewer python=3.13
+conda activate viewer
+pip install flask pandas
+
+python web_narrations.py --no-filter --video-id P01-20240202-110250
+```
+
+List of video id's in ```youtube-links/HD_EPIC_YouTube_URLs.csv```.
+
 ## Project Webpage
 Dataset - download and further information is available from [Project Webpage](https://hd-epic.github.io/)
 
