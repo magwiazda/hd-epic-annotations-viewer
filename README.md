@@ -15,6 +15,8 @@ conda activate viewer
 pip install flask pandas
 
 python web_narrations.py --no-filter --video-id P01-20240202-110250
+python web_narrations.py --no-filter --video-id P02-20240209-184316
+
 ```
 
 List of video id's in ```youtube-links/HD_EPIC_YouTube_URLs.csv```.

@@ -61,6 +61,27 @@ def get_target_noun_ids(noun_classes_path: str) -> set:
         pass
     return ids
 
+
+def build_instance_to_key_map(csv_path: str) -> dict:
+    """Return {instance_string: canonical_key} from a verb/noun classes CSV."""
+    import ast as _ast
+    import csv as _csv
+    m = {}
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                key = row["key"]
+                m[key] = key
+                try:
+                    instances = _ast.literal_eval(row["instances"])
+                except Exception:
+                    instances = []
+                for inst in instances:
+                    m[inst] = key
+    except FileNotFoundError:
+        pass
+    return m
+
 # ── HTML / JS template ────────────────────────────────────────────────────────
 
 TEMPLATE = r"""<!DOCTYPE html>
@@ -119,13 +140,22 @@ TEMPLATE = r"""<!DOCTYPE html>
     }
     .clock {
       margin-left: auto;
-      font-size: 22px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.2;
+    }
+    .clock-ts {
+      display: block;
+      font-size: 18px;
       font-weight: 700;
       color: var(--green);
-      letter-spacing: 3px;
-      font-variant-numeric: tabular-nums;
-      min-width: 110px;
-      text-align: right;
+      letter-spacing: 2px;
+    }
+    .clock-frame {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 1px;
     }
 
     /* ── main ── */
@@ -294,6 +324,32 @@ TEMPLATE = r"""<!DOCTYPE html>
       color: #e3b341;
       border: 1px solid rgba(210, 153, 34, .25);
     }
+    .tag-pair {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 10px;
+      overflow: hidden;
+      font-size: 10px;
+      white-space: nowrap;
+      border: 1px solid rgba(88, 166, 255, .25);
+    }
+    .tag-pair .pair-verb {
+      background: rgba(88, 166, 255, .18);
+      color: #79c0ff;
+      padding: 1px 6px;
+    }
+    .tag-pair .pair-sep {
+      background: rgba(88, 166, 255, .06);
+      color: #555e6a;
+      padding: 1px 3px;
+      font-size: 9px;
+    }
+    .tag-pair .pair-noun {
+      background: rgba(210, 153, 34, .18);
+      color: #e3b341;
+      padding: 1px 6px;
+      border-left: 1px solid rgba(88, 166, 255, .15);
+    }
 
     /* loading overlay */
     #loading {
@@ -321,7 +377,10 @@ TEMPLATE = r"""<!DOCTYPE html>
     <kbd>Space</kbd> play/pause &nbsp;
     <kbd>←</kbd> <kbd>→</kbd> ±10 s
   </span>
-  <span class="clock" id="clock">00:00.000</span>
+  <span class="clock" id="clock">
+    <span class="clock-ts"  id="clock-ts">00:00.000</span>
+    <span class="clock-frame" id="clock-frame">frame 0</span>
+  </span>
 </header>
 
 <div class="main">
@@ -490,8 +549,14 @@ TEMPLATE = r"""<!DOCTYPE html>
     el.classList.add("current");
   }
 
-  function makeTags(words, cls) {
-    return (words || []).map(w => `<span class="tag ${cls}">${esc(w)}</span>`).join("");
+  function makePairTags(pairs) {
+    return (pairs || []).map(([v, n]) =>
+      `<span class="tag-pair">` +
+        `<span class="pair-verb">${esc(v)}</span>` +
+        `<span class="pair-sep">→</span>` +
+        `<span class="pair-noun">${esc(n)}</span>` +
+      `</span>`
+    ).join("");
   }
 
   function appendNarrationLine(n, idx) {
@@ -500,15 +565,13 @@ TEMPLATE = r"""<!DOCTYPE html>
     el.className = "line";
     el.id = "n" + idx;
 
-    const verbTags = makeTags(n.verbs, "tag-verb");
-    const nounTags = makeTags(n.nouns, "tag-noun");
-    const hasTags  = verbTags || nounTags;
+    const pairTags = makePairTags(n.pairs);
 
     el.innerHTML =
-      `<span class="ts">[${fmtTs(n.start_timestamp)}]</span>` +
+      `<span class="ts">[${fmtTs(n.start_timestamp)} · f${Math.floor(n.start_timestamp * 30)}]</span>` +
       `<span class="txt">` +
         `${esc(n.narration)}` +
-        (hasTags ? `<div class="tags">${verbTags}${nounTags}</div>` : "") +
+        (pairTags ? `<div class="tags">${pairTags}</div>` : "") +
       `</span>`;
     term.appendChild(el);
     bumpCurrent(el);
@@ -533,7 +596,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     el.className = "line line-fixture " + (isStart ? "move-start" : "move-end");
     el.id = "f" + idx;
     el.innerHTML =
-      `<span class="ts">[${fmtTs(f.timestamp)}]</span>` +
+      `<span class="ts">[${fmtTs(f.timestamp)} · f${Math.floor(f.timestamp * 30)}]</span>` +
       `<span class="fx-icon" style="color:${color}">${icon}</span>` +
       `<span class="txt">` +
         `<span class="fx-name" style="color:${color}">${esc(f.name)}</span>` +
@@ -557,7 +620,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     const t = player.getCurrentTime();
 
     // Update clock
-    document.getElementById("clock").textContent = fmtTs(t);
+    document.getElementById("clock-ts").textContent = fmtTs(t);
+    document.getElementById("clock-frame").textContent = "frame " + Math.floor(t * 30);
 
     // Backward seek detected → reset terminal
     if (t < lastT - 2) clearTerminal();
@@ -627,7 +691,7 @@ def extract_yt_id(url: str) -> str:
     return url
 
 
-def load_fixture_events(fixtures_dir: str, video_id: str) -> list:
+def load_fixture_events(fixtures_dir: str, video_id: str, noun_map: dict = None) -> list:
     """
     For each track in assoc_info.json, emit two events:
       - type="start"  at time_segment[0]  with the fixture of the chronologically
@@ -655,9 +719,11 @@ def load_fixture_events(fixtures_dir: str, video_id: str) -> list:
     video_masks  = mask_data[video_id]
     video_assocs = assoc_data[video_id]
 
+    _nm = noun_map or {}
     events = []
     for assoc in video_assocs.values():
-        name = assoc.get("name", "object")
+        raw_name = assoc.get("name", "object")
+        name = _nm.get(raw_name, raw_name)
         for track in assoc.get("tracks", []):
             time_seg = track.get("time_segment", [])
             mask_ids = track.get("masks", [])
@@ -729,6 +795,10 @@ def main():
         "--no-filter", action="store_true",
         help="Show all narrations instead of only appliance/fixture-related ones",
     )
+    parser.add_argument(
+        "--raw-tags", action="store_true",
+        help="Show raw verb/noun strings from the narration instead of canonical class keys",
+    )
     args = parser.parse_args()
 
     # ── validate video id ──
@@ -764,19 +834,32 @@ def main():
                 lambda nc: bool(nc) and any(x in target_ids for x in nc)
             )]
 
-    sub = sub[["start_timestamp", "narration", "nouns", "verbs"]]
+    # ── optional tag normalisation ──
+    if not args.raw_tags:
+        classes_dir = os.path.join(HERE, "narrations-and-action-segments")
+        verb_map = build_instance_to_key_map(os.path.join(classes_dir, "HD_EPIC_verb_classes.csv"))
+        noun_map = build_instance_to_key_map(os.path.join(classes_dir, "HD_EPIC_noun_classes.csv"))
+    else:
+        verb_map = noun_map = {}
+
+    def _norm_pair(v, n):
+        return [verb_map.get(v, v), noun_map.get(n, n)]
+
+    sub = sub[["start_timestamp", "narration", "nouns", "verbs", "pairs"]]
     rows = []
     for _, r in sub.iterrows():
+        raw_pairs = [list(p) for p in r["pairs"]] if r["pairs"] is not None else []
         rows.append({
             "start_timestamp": float(r["start_timestamp"]),
             "narration":       str(r["narration"]),
             "verbs":           list(r["verbs"]) if r["verbs"] is not None else [],
             "nouns":           list(r["nouns"]) if r["nouns"] is not None else [],
+            "pairs":           [_norm_pair(v, n) for v, n in raw_pairs],
         })
     if not rows:
         sys.exit(f"No narrations found for '{args.video_id}'")
 
-    fixture_events = load_fixture_events(args.fixtures_dir, args.video_id)
+    fixture_events = load_fixture_events(args.fixtures_dir, args.video_id, noun_map)
 
     _state["video_id"]   = args.video_id
     _state["yt_id"]      = yt_id
