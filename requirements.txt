@@ -1,0 +1,10 @@
+flask
+ipython
+ipykernel
+numpy
+pandas
+matplotlib
+plotly
+trimesh
+pillow
+nbformat
