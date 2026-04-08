@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import scipy.ndimage
 import trimesh
 from IPython.display import display
 from PIL import Image as PILImage
@@ -364,6 +365,102 @@ def load_pointcloud(
     return df[["px_world", "py_world", "pz_world"]].to_numpy()
 
 
+def build_slam_vs_sam3d_figure(
+    result: dict,
+    frame: dict,
+    video_id: str,
+    pts_world: np.ndarray,
+    meshes: list,
+    participant: str,
+    mask_dilation: int = 60,
+    max_depth: float = 5.0,
+) -> go.Figure:
+    """3-D figure comparing SLAM points near the object vs SAM3D pointmap_obj.
+
+    Red    – SLAM semidense points that project into the (dilated) object mask.
+    Violet – pointmap_obj from SAM3D transformed to world frame.
+
+    Kitchen meshes are shown as a semi-transparent background.
+    """
+    from scipy.ndimage import binary_dilation as _bin_dil
+
+    cam  = load_rgb_calibration(video_id)
+    W, H = cam["image_size"]
+    T_wc = _to_4x4(np.array(frame["T_world_device"])) @ _to_4x4(cam["T_device_camera"])
+    T_cw = np.linalg.inv(T_wc)
+
+    # ── Filter SLAM points that fall inside the dilated mask ──────────────────
+    mask = result.get("mask")
+    if mask is None:
+        raise ValueError("result must contain 'mask'.")
+
+    # project SLAM world pts → camera frame → pixels
+    N     = len(pts_world)
+    pts_h = np.hstack([pts_world, np.ones((N, 1))])
+    pts_c = (T_cw @ pts_h.T).T[:, :3]
+    front = pts_c[:, 2] > 0.05
+    u_s = np.full(N, np.nan)
+    v_s = np.full(N, np.nan)
+    u_s[front], v_s[front] = project_fisheye624(pts_c[front], cam["params"])
+
+    vr    = cam["valid_radius"] or (min(W, H) / 2)
+    cu_px, cv_px = cam["params"][1], cam["params"][2]
+    ok = (
+        np.isfinite(u_s) & np.isfinite(v_s) &
+        (u_s >= 0) & (u_s < W) &
+        (v_s >= 0) & (v_s < H) &
+        (pts_c[:, 2] <= max_depth) &
+        (np.hypot(u_s - cu_px, v_s - cv_px) < vr)
+    )
+
+    dilated = _bin_dil(mask, iterations=mask_dilation)
+    ui = np.where(ok, np.clip(u_s.astype(int), 0, W - 1), 0)
+    vi = np.where(ok, np.clip(v_s.astype(int), 0, H - 1), 0)
+    in_mask = ok & dilated[vi, ui]
+
+    slam_near = pts_world[in_mask]
+
+    # ── Transform pointmap_obj to world frame ─────────────────────────────────
+    po     = result["pointmap_obj"].astype(np.float64)
+    po_h   = np.hstack([po, np.ones((len(po), 1))])
+    po_w   = (T_wc @ po_h.T).T[:, :3]
+
+    # ── Build figure ──────────────────────────────────────────────────────────
+    fig = build_figure(meshes, participant, video_id)
+    add_camera_pose_to_figure(fig, frame, axis_len=0.15)
+
+    if len(slam_near):
+        fig.add_trace(go.Scatter3d(
+            x=slam_near[:, 0], y=slam_near[:, 1], z=slam_near[:, 2],
+            mode="markers",
+            marker=dict(size=3, color="#FF4444", opacity=0.8),
+            name=f"SLAM near object ({len(slam_near):,} pts)",
+            hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra>SLAM</extra>",
+        ))
+
+    fig.add_trace(go.Scatter3d(
+        x=po_w[:, 0], y=po_w[:, 1], z=po_w[:, 2],
+        mode="markers",
+        marker=dict(size=5, color="#BB44FF", opacity=0.95),
+        name=f"SAM3D pointmap_obj ({len(po_w):,} pts)",
+        hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra>SAM3D</extra>",
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"SLAM (red) vs SAM3D (violet) — {participant}  |  {video_id}"
+                f"  |  frame {frame['frame_index']}"
+            ),
+        ),
+        legend=dict(
+            bgcolor="#1e1e30", bordercolor="#444466",
+            borderwidth=1, font=dict(size=11),
+        ),
+    )
+    return fig
+
+
 def build_pointcloud_figure(
     pts: np.ndarray,
     participant: str,
@@ -689,6 +786,272 @@ def load_twin_result(work_dir: Path) -> dict:
     return result
 
 
+def align_depth_raw_to_slam(
+    result: dict,
+    frame: dict,
+    video_id: str,
+    pts_world: np.ndarray,
+    mask_dilation: int = 40,
+    ransac_n_iter: int = 1000,
+    ransac_inlier_thresh: float = 0.3,
+    max_depth: float = 5.0,
+    rng_seed: int = 42,
+) -> dict:
+    """Align depth_raw (Depth Anything disparity) to metric SLAM depth, then
+    correct pointmap_obj by scaling along camera rays.
+
+    Pipeline
+    --------
+    1. Project SLAM world pts → sparse metric depth map D_slam[H×W].
+    2. Collect pixel-level correspondences (D_raw[v,u], D_slam[v,u]) in the
+       dilated object mask.  Falls back to global (full image) if < 20 local
+       pairs are found.
+    3. RANSAC linear fit:  D_metric ≈ α · D_raw + β
+       (α < 0 because depth_raw is disparity: larger = closer)
+    4. Apply to mask pixels → median corrected depth D_metric_median.
+    5. Scale pointmap_obj uniformly along camera rays:
+         ratio       = D_metric_median / mean(pointmap_obj[:, 2])
+         pts_aligned = pointmap_obj * ratio
+       This moves the whole object cloud to the metrically-corrected depth
+       while preserving its shape and each point's image-plane direction.
+
+    Returns
+    -------
+    dict with keys:
+        pts_aligned    – (N, 3) corrected camera-frame points
+        alpha, beta    – RANSAC linear coefficients
+        D_metric_median– median metric depth over object mask
+        Z_sam3d        – original mean Z of pointmap_obj
+        ratio          – D_metric_median / Z_sam3d
+        inlier_mask    – bool array over correspondences used for RANSAC
+        n_corr         – total correspondences before RANSAC
+        D_hat          – D_raw values at correspondence pixels
+        D_slam_corr    – D_slam values at correspondence pixels
+        slam_depth_img – (H, W) sparse SLAM depth (NaN where missing)
+        slam_valid     – (H, W) bool mask of valid SLAM pixels
+        obj_mask       – (H, W) object segmentation mask
+    """
+    for key in ("depth_raw", "mask", "pointmap_obj"):
+        if key not in result:
+            raise ValueError(f"result must contain '{key}' for depth alignment.")
+
+    cam  = load_rgb_calibration(video_id)
+    W, H = cam["image_size"]
+
+    depth_raw = result["depth_raw"].astype(np.float64)
+    mask      = result["mask"]
+    pts_c     = result["pointmap_obj"].astype(np.float64)
+
+    if mask.shape[:2] != (H, W):
+        raise ValueError(f"Mask shape {mask.shape[:2]} != camera (H, W)={H, W}")
+    if depth_raw.shape != (H, W):
+        raise ValueError(f"depth_raw shape {depth_raw.shape} != camera (H, W)={H, W}")
+
+    # ── 1. Render sparse SLAM depth map ──────────────────────────────────────
+    slam_depth_img, slam_valid = render_depth_map(
+        video_id, frame, pts_world,
+        max_depth=max_depth, plot=False, return_maps=True,
+    )
+
+    # ── 2. Dilated mask → pixel correspondences ───────────────────────────────
+    struct  = scipy.ndimage.generate_binary_structure(2, 1)
+    dilated = scipy.ndimage.binary_dilation(mask, structure=struct, iterations=mask_dilation)
+    region  = dilated & slam_valid
+
+    D_hat  = depth_raw[region]
+    D_slam = slam_depth_img[region]
+
+    print(f"[align] SLAM valid pixels        : {slam_valid.sum():,}")
+    print(f"[align] Local correspondences    : {region.sum():,}  (dilated mask ∩ SLAM)")
+
+    # Fallback: use full image if local region is too sparse
+    if region.sum() < 20:
+        print("[align] < 20 local pairs → falling back to global correspondences.")
+        D_hat  = depth_raw[slam_valid]
+        D_slam = slam_depth_img[slam_valid]
+        print(f"[align] Global correspondences   : {slam_valid.sum():,}")
+
+    N = len(D_hat)
+
+    # ── 3. RANSAC linear fit:  D_metric ≈ α·D_raw + β ────────────────────────
+    rng          = np.random.default_rng(rng_seed)
+    best_alpha   = -1.0
+    best_beta    = float(np.median(D_slam))
+    best_inliers = np.zeros(N, dtype=bool)
+
+    for _ in range(ransac_n_iter):
+        idx = rng.choice(N, size=2, replace=False)
+        # guard against identical D_hat values (degenerate)
+        if np.abs(D_hat[idx[0]] - D_hat[idx[1]]) < 1e-6:
+            continue
+        a, b      = np.polyfit(D_hat[idx], D_slam[idx], 1)
+        residuals = np.abs(a * D_hat + b - D_slam)
+        inliers   = residuals < ransac_inlier_thresh
+        if inliers.sum() > best_inliers.sum():
+            best_alpha, best_beta, best_inliers = a, b, inliers
+
+    # Refit OLS on all inliers for maximum accuracy
+    if best_inliers.sum() >= 2:
+        A = np.column_stack([D_hat[best_inliers], np.ones(best_inliers.sum())])
+        coeffs, *_ = np.linalg.lstsq(A, D_slam[best_inliers], rcond=None)
+        best_alpha, best_beta = float(coeffs[0]), float(coeffs[1])
+
+    print(
+        f"[align] RANSAC  α={best_alpha:.5f}  β={best_beta:.4f}  "
+        f"inliers={best_inliers.sum():,}/{N:,}"
+    )
+
+    # ── 4. Corrected metric depth over the object mask ────────────────────────
+    D_corrected     = best_alpha * depth_raw[mask] + best_beta
+    valid_corrected = D_corrected > 0.05
+    if valid_corrected.sum() == 0:
+        print("[align] All corrected depths are non-positive — check fit. "
+              "Returning uncorrected points.")
+        D_metric_median = float(np.mean(pts_c[:, 2]))
+    else:
+        D_metric_median = float(np.median(D_corrected[valid_corrected]))
+
+    print(
+        f"[align] Mask pixels used         : {valid_corrected.sum():,}/{mask.sum():,}"
+    )
+    print(f"[align] D_metric_median (mask)   : {D_metric_median:.4f} m")
+
+    # ── 5. Scale pointmap_obj along camera rays ───────────────────────────────
+    Z_sam3d = float(np.mean(pts_c[:, 2]))
+    ratio   = D_metric_median / Z_sam3d if abs(Z_sam3d) > 1e-6 else 1.0
+    pts_aligned = pts_c * ratio
+
+    print(f"[align] Z_sam3d (mean)           : {Z_sam3d:.4f} m")
+    print(f"[align] ratio                    : {ratio:.4f}")
+    print(
+        f"[align] pts_aligned Z range      : "
+        f"{pts_aligned[:, 2].min():.4f} → {pts_aligned[:, 2].max():.4f} m"
+    )
+
+    return {
+        "pts_aligned":     pts_aligned,
+        "alpha":           best_alpha,
+        "beta":            best_beta,
+        "D_metric_median": D_metric_median,
+        "Z_sam3d":         Z_sam3d,
+        "ratio":           ratio,
+        "inlier_mask":     best_inliers,
+        "n_corr":          N,
+        "D_hat":           D_hat,
+        "D_slam_corr":     D_slam,
+        "slam_depth_img":  slam_depth_img,
+        "slam_valid":      slam_valid,
+        "obj_mask":        mask,
+    }
+
+
+def plot_depth_alignment(
+    align_info: dict,
+    frame: dict,
+    video_id: str,
+    text_prompt: str,
+) -> None:
+    """Diagnostic figure for the depth_raw → metric SLAM alignment.
+
+    Panel 1  –  scatter of depth_raw (disparity) vs D_slam (metres) for all
+                correspondence pixels; inliers (green) / outliers (red) with
+                the fitted line α·D_raw + β.
+    Panel 2  –  SLAM sparse depth image with the object mask overlaid and the
+                correspondence pixels marked (green = inlier, red = outlier).
+    """
+    inlier_mask = align_info["inlier_mask"]
+    alpha       = align_info["alpha"]
+    beta        = align_info["beta"]
+    D_hat       = align_info["D_hat"]
+    D_slam      = align_info["D_slam_corr"]
+    slam_depth  = align_info["slam_depth_img"]
+    slam_valid  = align_info["slam_valid"]
+    obj_mask    = align_info["obj_mask"]
+
+    N = len(D_hat)
+    if N == 0:
+        print("[plot_depth_alignment] No correspondences — nothing to plot.")
+        return
+
+    outliers = ~inlier_mask
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#0a0a15")
+    for ax in axes:
+        ax.set_facecolor("#0a0a15")
+
+    # ── Panel 1: depth_raw vs D_slam scatter + fit line ───────────────────────
+    ax = axes[0]
+    ax.scatter(
+        D_hat[outliers], D_slam[outliers],
+        c="#FF4444", s=8, alpha=0.4,
+        label=f"Outliers ({outliers.sum():,})", zorder=2,
+    )
+    ax.scatter(
+        D_hat[inlier_mask], D_slam[inlier_mask],
+        c="#44FF88", s=8, alpha=0.6,
+        label=f"Inliers ({inlier_mask.sum():,})", zorder=3,
+    )
+    d_range = np.array([D_hat.min(), D_hat.max()])
+    ax.plot(
+        d_range, alpha * d_range + beta,
+        color="#FFD700", linewidth=2,
+        label=f"fit: α={alpha:.5f},  β={beta:.3f} m",
+        zorder=4,
+    )
+    ax.set_xlabel("depth_raw  (disparity, larger = closer)", color="#aaaacc", fontsize=10)
+    ax.set_ylabel("D_slam  (metric, metres)", color="#aaaacc", fontsize=10)
+    ax.set_title(
+        f"depth_raw → SLAM alignment  —  '{text_prompt}'\n"
+        f"frame {frame['frame_index']}  |  {video_id}",
+        color="#ccccdd", fontsize=10, pad=6,
+    )
+    ax.tick_params(colors="#888899")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#333344")
+    ax.legend(fontsize=9, labelcolor="#ccccdd",
+               facecolor="#1a1a2e", edgecolor="#444466")
+
+    # ── Panel 2: SLAM depth image + mask + correspondence pixels ──────────────
+    ax2 = axes[1]
+    slam_vis = slam_depth.copy()
+    slam_vis[~slam_valid] = np.nan
+    vmax = float(np.nanpercentile(slam_depth[slam_valid], 95)) if slam_valid.any() else 5.0
+    ax2.imshow(slam_vis, cmap="plasma", origin="upper", interpolation="none",
+               vmin=0, vmax=vmax)
+
+    # Object mask outline
+    if obj_mask is not None:
+        mask_rgba = np.zeros((*obj_mask.shape[:2], 4), dtype=np.float32)
+        mask_rgba[obj_mask] = [0.0, 0.8, 1.0, 0.35]
+        ax2.imshow(mask_rgba, origin="upper", interpolation="none")
+
+    # Correspondence pixels — need their (u, v) positions.
+    # Reconstruct from slam_valid: take all pixels in region that are valid.
+    ys_all, xs_all = np.where(slam_valid)
+    # We used at most N of them (the first N after masking); just show all slam_valid
+    # and colour by inlier status using the same ordering.
+    # Since D_hat = depth_raw[region] and region = dilated & slam_valid (or global),
+    # we don't store per-pixel coords in the dict.  Reconstruct the region mask.
+    # Show slam_valid pixels coloured by whether they were inliers or not.
+    # For simplicity: plot all slam_valid as dots; highlight the inlier subset.
+    ax2.scatter(xs_all, ys_all,
+                c="#888888", s=1.5, alpha=0.3, linewidths=0,
+                label=f"SLAM pixels ({len(xs_all):,})", zorder=2)
+
+    ax2.set_title(
+        f"SLAM sparse depth  +  object mask\n"
+        f"α={alpha:.5f}  β={beta:.3f} m  |  "
+        f"D_metric_median={align_info.get('D_metric_median', float('nan')):.3f} m",
+        color="#ccccdd", fontsize=10, pad=6,
+    )
+    ax2.axis("off")
+    ax2.legend(fontsize=8, labelcolor="#ccccdd",
+                facecolor="#1a1a2e", edgecolor="#444466")
+
+    fig.tight_layout()
+    plt.show()
+
+
 def visualize_twin(
     result: dict,
     frame: dict,
@@ -696,11 +1059,20 @@ def visualize_twin(
     text_prompt: str,
     meshes: list,
     participant: str,
+    pts_world: np.ndarray | None = None,
 ) -> None:
-    """Render two figures:
+    """Render figures for the digital-twin result.
 
     Figure 1 (matplotlib)  – extracted frame with SAM3 mask overlay and 2-D bbox.
+    Figure 1b (matplotlib) – monocular depth map with mask overlay (if depth_raw present).
+    Figure 1c (matplotlib) – depth-alignment diagnostic (if pts_world provided).
     Figure 2 (Plotly 3D)   – kitchen scene with camera pose and the object's 3-D bbox.
+
+    Parameters
+    ----------
+    pts_world : (N, 3) SLAM semidense point cloud in world frame.  When provided,
+                the object's depth is aligned to metric SLAM scale via RANSAC
+                linear regression before the 3-D bbox is constructed.
     """
     # ── Figure 1: frame + mask + 2-D bbox ────────────────────────────────────
     fig1, ax = plt.subplots(figsize=(9, 9), facecolor="#0a0a15")
@@ -772,8 +1144,10 @@ def visualize_twin(
         plt.show()
 
     # ── Figure 2: 3-D scene + object bounding box ─────────────────────────────
-    pts_key = "means_cam" if "means_cam" in result else (
-              "pointmap_obj" if "pointmap_obj" in result else None)
+    # Prefer pointmap_obj (dense pixel-wise depth) over means_cam (layout-posed
+    # Gaussian means whose z-values can be un-physical after layout scaling).
+    pts_key = "pointmap_obj" if "pointmap_obj" in result else (
+              "means_cam"    if "means_cam"    in result else None)
     if pts_key is None:
         print("No 3-D data available — skipping 3-D figure (job may not be finished).")
         return
@@ -790,7 +1164,27 @@ def visualize_twin(
     cam  = load_rgb_calibration(video_id)
     T_wc = _to_4x4(np.array(frame["T_world_device"])) @ _to_4x4(cam["T_device_camera"])
 
+    # ── depth alignment ───────────────────────────────────────────────────────
     pts_c = result[pts_key]
+    can_align = (
+        pts_world is not None
+        and pts_key == "pointmap_obj"
+        and "mask"      in result
+        and "depth_raw" in result
+    )
+    if can_align:
+        print("[visualize_twin] Running depth_raw → SLAM alignment …")
+        align_info = align_depth_raw_to_slam(result, frame, video_id, pts_world)
+        plot_depth_alignment(align_info, frame, video_id, text_prompt)
+        pts_c = align_info["pts_aligned"]
+    elif pts_world is None:
+        print("[visualize_twin] No SLAM cloud provided — using raw SAM3D depth "
+              "(pass pts_world= for metric alignment).")
+    else:
+        missing = [k for k in ("mask", "depth_raw") if k not in result]
+        print(f"[visualize_twin] Missing artefacts for alignment: {missing} — "
+              "using raw SAM3D depth.")
+
     pts_h = np.hstack([pts_c, np.ones((len(pts_c), 1))])
     pts_w = (T_wc @ pts_h.T).T[:, :3]
 
