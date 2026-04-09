@@ -30,6 +30,12 @@ _VIDEOS_ROOT = Path("/usr/prakt/s0021/EH/HD-EPIC/Videos")
 _SLURM_LOGS  = Path("/usr/prakt/s0021/slurm/logs")
 _VIDEO_FPS   = 30
 
+# ── Depth alignment options ────────────────────────────────────────────────────
+# When True, the object mask is dilated before collecting SLAM correspondences
+# so that nearby surface points are included in the linear fit.
+# Set to False to use only the exact mask pixels (may give fewer correspondences).
+ALIGN_USE_MASK_DILATION: bool = True
+
 # ── Color palette ──────────────────────────────────────────────────────────────
 
 _TYPE_COLORS = {
@@ -715,24 +721,24 @@ def submit_twin_job(
         "set -e\n"
         f"source {_conda_base}/etc/profile.d/conda.sh\n"
         "\n"
-        # "echo '=== Step 1: SAM3 segmentation ==='\n"
-        # f"conda run -n sam3 python {sam3_script} \\\n"
-        # f"    --image  {frame_path} \\\n"
-        # f'    --prompt "{text_prompt}" \\\n'
-        # f"    --out-dir {work_dir}\n"
-        # "\n"
-        # "conda activate sam3\n"
-        # "echo '=== Step 2: Monocular depth estimation ==='\n"
-        # f"python {depth_script} \\\n"
-        # f"    --image   {frame_path} \\\n"
-        # f"    --out-dir {work_dir}\n"
-        # "\n"
-        # "echo '=== Step 3: SAM-3D-Objects reconstruction ==='\n"
-        # f"conda run -n sam3d-objects python {sam3d_script} \\\n"
-        # f"    --image   {frame_path} \\\n"
-        # f"    --mask    {work_dir}/mask.png \\\n"
-        # f"    --out-dir {work_dir}\n"
-        # "\n"
+        "echo '=== Step 1: SAM3 segmentation ==='\n"
+        f"conda run -n sam3 python {sam3_script} \\\n"
+        f"    --image  {frame_path} \\\n"
+        f'    --prompt "{text_prompt}" \\\n'
+        f"    --out-dir {work_dir}\n"
+        "\n"
+        "conda activate sam3\n"
+        "echo '=== Step 2: Monocular depth estimation ==='\n"
+        f"python {depth_script} \\\n"
+        f"    --image   {frame_path} \\\n"
+        f"    --out-dir {work_dir}\n"
+        "\n"
+        "echo '=== Step 3: SAM-3D-Objects reconstruction ==='\n"
+        f"conda run -n sam3d-objects python {sam3d_script} \\\n"
+        f"    --image   {frame_path} \\\n"
+        f"    --mask    {work_dir}/mask.png \\\n"
+        f"    --out-dir {work_dir}\n"
+        "\n"
         "echo '=== Done ==='\n"
     )
     print(f"Wrote sbatch     → {sbatch_path}")
@@ -853,16 +859,23 @@ def align_depth_raw_to_slam(
         max_depth=max_depth, plot=False, return_maps=True,
     )
 
-    # ── 2. Dilated mask → pixel correspondences ───────────────────────────────
-    struct  = scipy.ndimage.generate_binary_structure(2, 1)
-    dilated = scipy.ndimage.binary_dilation(mask, structure=struct, iterations=mask_dilation)
-    region  = dilated & slam_valid
+    # ── 2. Mask (optionally dilated) → pixel correspondences ─────────────────
+    if ALIGN_USE_MASK_DILATION:
+        struct  = scipy.ndimage.generate_binary_structure(2, 1)
+        search_mask = scipy.ndimage.binary_dilation(
+            mask, structure=struct, iterations=mask_dilation
+        )
+        region_label = f"dilated mask ({mask_dilation} px) ∩ SLAM"
+    else:
+        search_mask  = mask
+        region_label = "exact mask ∩ SLAM"
 
+    region = search_mask & slam_valid
     D_hat  = depth_raw[region]
     D_slam = slam_depth_img[region]
 
     print(f"[align] SLAM valid pixels        : {slam_valid.sum():,}")
-    print(f"[align] Local correspondences    : {region.sum():,}  (dilated mask ∩ SLAM)")
+    print(f"[align] Local correspondences    : {region.sum():,}  ({region_label})")
 
     # Fallback: use full image if local region is too sparse
     if region.sum() < 20:
